@@ -26,7 +26,7 @@ with st.sidebar:
 
     st.header("Surface routing (simplified)")
 
-    runoff_fraction = st.slider("Runoff fraction (PR)", 0.0, 1.0, 0.2)
+    runoff_fraction = st.slider("Runoff fraction (PR)", 0.0, 1.0, 0.0)
     contributing_area_pct = st.slider(
         "Proportion of area contributing to soil store (%)",
         0.0, 100.0, 50.0
@@ -41,7 +41,7 @@ with st.sidebar:
     soil_porosity_pct = st.slider("Soil porosity (%)", 1.0, 100.0, 50.0)
     percolation_threshold_pct = st.slider("Percolation threshold (%)", 0.0, 100.0, 10.5)
     percolation_coefficient = st.slider("Percolation coefficient (1/day)", 0.1, 10.0, 1.0)
-    percolation_percentage = st.slider("Percolation % infiltrating", 0.0, 100.0, 5.0)
+    percolation_percentage = st.slider("Percolation % infiltrating", 0.0, 100.0, 50.0)
     initial_saturation = st.slider("Initial soil saturation (%)", 0.0, 100.0, 10.0)
 
     potential_evap_mmday = st.slider("Potential evaporation (mm/day)", 0.0, 10.0, 1.5)
@@ -265,7 +265,7 @@ st.subheader("Flows (1 ha)")
 fig = go.Figure()
 fig.add_scatter(x=df.time_hr, y=df.percolation_lps, name="Percolation")
 fig.add_scatter(x=df.time_hr, y=df.ri_infiltration_lps, name="RI infiltration")
-fig.add_scatter(x=df.time_hr, y=df.soil_inflow_lps, name="Soil inflow")
+fig.add_scatter(x=df.time_hr, y=df.soil_inflow_lps, name="Soil inflow", visible='legendonly')
 fig.update_layout(yaxis_title="Flow (L/s over 1 ha)")
 st.plotly_chart(fig, use_container_width=True)
 
