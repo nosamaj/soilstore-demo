@@ -167,55 +167,61 @@ def run_model():
             x_excess[i] = 0.0
             continue
 
+
         # ----------------------------------------
         # 4) Work in storage-above-threshold space
         # ----------------------------------------
+
+        # current excess above threshold
         x_old = max(D[i - 1] - Dt, 0.0)
 
         # net forcing into soil store as depth rate [m/s]
-        # note: this is the rate entering the reservoir state equation
-        u = (q_soil[i] - q_evap[i]) / (Psoil * A)
+        # (this already includes evap correctly)
+        u = (q_soil[i] - q_evap[i]) / (Psoil * A) if Psoil > 0 else 0.0
 
-        if D[i - 1] < Dt:
-            # below threshold, fill toward threshold first
-            D_trial = D[i - 1] + u * dt_s
+        # --- Predictor ONLY for detecting threshold crossing ---
+        D_pred = D[i - 1] + u * dt_s
+        D_pred = np.clip(D_pred, 0.0, Dmax)
 
-            if D_trial <= Dt or k_eff <= 0.0:
-                # still below threshold after this step
-                D[i] = np.clip(D_trial, 0.0, Dmax)
-                q_perc[i] = 0.0
-                q_ri[i] = 0.0
-                x_excess[i] = max(D[i] - Dt, 0.0)
-            else:
-                # cross threshold during this step
-                # time spent filling up to threshold
-                t_to_threshold = (Dt - D[i - 1]) / u if u > 0 else dt_s
-                t_to_threshold = np.clip(t_to_threshold, 0.0, dt_s)
-                dt2 = dt_s - t_to_threshold
+        # ----------------------------------------
+        # PERMEATION / PERCOLATION CALCULATION
+        # ----------------------------------------
+        if D_pred <= Dt:
+            # below threshold → no percolation
+            q_perc[i] = 0.0
+            x_excess[i] = 0.0
 
-                # now integrate the above-threshold excess for remaining time
-                expfac = np.exp(-k_eff * dt2)
-                x_new = (u / k_eff) * (1.0 - expfac)
-
-                D[i] = np.clip(Dt + x_new, 0.0, Dmax)
-                x_excess[i] = x_new
-                q_perc[i] = k_eff * A * x_new
-                q_ri[i] = alpha * q_perc[i]
         else:
-            # already above threshold: exact driven linear reservoir step
+            # --- Now integrate ABOVE-THRESHOLD reservoir ONLY ---
+            # IMPORTANT: use x_old (actual state), not D_pred (fixes peak behaviour)
+
             if k_eff > 0.0:
                 expfac = np.exp(-k_eff * dt_s)
+
+                # driven linear reservoir update (smooths peak properly)
                 x_new = x_old * expfac + (u / k_eff) * (1.0 - expfac)
             else:
                 x_new = x_old + u * dt_s
 
-            # do not allow negative excess
+            # prevent negative excess
             x_new = max(x_new, 0.0)
 
-            D[i] = np.clip(Dt + x_new, 0.0, Dmax)
-            x_excess[i] = x_new
+            # compute percolation from UPDATED excess
             q_perc[i] = k_eff * A * x_new
-            q_ri[i] = alpha * q_perc[i]
+            x_excess[i] = x_new
+
+        # rainfall-induced infiltration (clean version)
+        q_ri[i] = alpha * q_perc[i]
+
+        # ----------------------------------------
+        # FULL SOIL STORE MASS BALANCE (ALWAYS APPLY)
+        # ----------------------------------------
+        if Psoil > 0:
+            dDdt = (q_soil[i] - q_evap[i] - q_perc[i]) / (Psoil * A)
+            D[i] = np.clip(D[i - 1] + dDdt * dt_s, 0.0, Dmax)
+        else:
+            D[i] = 0.0
+
 
         # ----------------------------------------
         # 5) Cap at Dmax if needed
