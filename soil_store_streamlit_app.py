@@ -83,7 +83,7 @@ def make_storm(t, storm_type, start, duration, peak):
 # ======================
 
 def run_model():
-    A = 10000.0  # 1 hectare
+    A = 10000.0  # 1 hectare total area
 
     dt_s = dt_min * 60
     dt_hr = dt_min / 60
@@ -94,75 +94,128 @@ def run_model():
     n = len(t)
 
     # states
-    D = np.zeros(n)
+    D = np.zeros(n)                # soil water depth [m]
+    dep_store = np.zeros(n)        # depression storage depth [m]
 
     # flows
-    q_perc = np.zeros(n)
-    q_ri = np.zeros(n)
-    q_soil = np.zeros(n)
+    q_perc = np.zeros(n)           # percolation from soil store [m3/s]
+    q_ri = np.zeros(n)             # rainfall-induced infiltration to network [m3/s]
+    q_soil = np.zeros(n)           # inflow to soil store [m3/s]
+    q_runoff = np.zeros(n)         # surface runoff to network / bypass [m3/s]
+    q_dep_evap = np.zeros(n)       # evaporation from depression storage [m3/s]
+    q_soil_evap = np.zeros(n)      # evaporation from soil store [m3/s]
+    q_overflow = np.zeros(n)       # overflow when soil store full [m3/s]
 
-    # params
-    Psoil = soil_porosity_pct / 100
-    alpha = percolation_percentage / 100
-    area_factor = contributing_area_pct / 100
+    # parameters
+    Psoil = soil_porosity_pct / 100.0
+    alpha = percolation_percentage / 100.0
+    area_factor = contributing_area_pct / 100.0
 
     Dmax = soil_depth_m
-    Dt = (percolation_threshold_pct / 100) * Dmax
+    Dt = (percolation_threshold_pct / 100.0) * Dmax
 
-    
-    tau = percolation_coefficient * 86400  # seconds
-    k_eff = 1.0 / tau
-    # convert to 1/s
-    evap_full = potential_evap_mmday / 1000 / 86400
+    # Percolation coefficient is treated as a time coefficient in days:
+    # larger value => slower / longer-duration response
+    tau_s = percolation_coefficient * 86400.0
+    k_eff = 1.0 / tau_s
 
-    D[0] = (initial_saturation / 100) * Dmax
+    evap_mps = potential_evap_mmday / 1000.0 / 86400.0
 
-    dep_store = 0
+    # Initial condition
+    D[0] = min((initial_saturation / 100.0) * Dmax, Dmax)
+
+    dep_store_max = depression_storage_mm / 1000.0
 
     for i in range(1, n):
-        rain_mps = rain_mmhr[i] / 1000 / 3600
-        rainfall_depth = rain_mps * dt_s
+        rain_mps = rain_mmhr[i] / 1000.0 / 3600.0
+        rain_depth = rain_mps * dt_s  # rainfall depth this step [m]
 
-        # depression storage
-        available = max(depression_storage_mm / 1000 - dep_store, 0)
-        fill = min(rainfall_depth, available)
-        dep_store += fill
+        # ------------------------------------------------------------
+        # 1) Depression storage first (ICM-like sequencing)
+        # ------------------------------------------------------------
 
-        effective = rainfall_depth - fill
+        # evaporation loss from depression storage
+        dep_evap_depth = min(dep_store[i - 1], evap_mps * dt_s)
+        dep_store_tmp = dep_store[i - 1] - dep_evap_depth
+        q_dep_evap[i] = dep_evap_depth * A / dt_s
 
-        # === KEY NEW LOGIC ===
-        soil_depth = (1 - runoff_fraction) * area_factor * effective
+        # fill depression storage
+        dep_available = max(dep_store_max - dep_store_tmp, 0.0)
+        dep_fill = min(rain_depth, dep_available)
+        dep_store_after_fill = dep_store_tmp + dep_fill
+
+        # effective rainfall after depression storage
+        effective_depth = rain_depth - dep_fill
+
+        # ------------------------------------------------------------
+        # 2) Partition effective rainfall:
+        #    - non-contributing area => runoff
+        #    - contributing area split by PR into runoff vs soil-store inflow
+        # ------------------------------------------------------------
+        soil_candidate_depth = effective_depth * area_factor * (1.0 - runoff_fraction)
         runoff_depth = (
-            runoff_fraction * effective +
-            (1 - area_factor) * effective
+            effective_depth * (1.0 - area_factor) +
+            effective_depth * area_factor * runoff_fraction
         )
 
-        q_soil[i] = soil_depth * A / dt_s
+        # ------------------------------------------------------------
+        # 3) Soil store evaporation and percolation
+        # ------------------------------------------------------------
+        sat = D[i - 1] / Dmax if Dmax > 0 else 0.0
 
-        # evaporation
-        sat = D[i-1] / Dmax if Dmax > 0 else 0
-        q_evap = evap_full * sat * A
+        soil_evap_depth = min(D[i - 1], evap_mps * sat * dt_s)
+        q_soil_evap[i] = soil_evap_depth * Psoil * A / dt_s
 
-        # percolation
-        if D[i-1] < Dt:
-            q_perc[i] = 0
+        if D[i - 1] < Dt:
+            q_perc[i] = 0.0
         else:
-            q_perc[i] = k_eff * A * (D[i-1] - Dt)
+            q_perc[i] = k_eff * A * max(D[i - 1] - Dt, 0.0)
 
         q_ri[i] = alpha * q_perc[i] * Psoil
 
-        dDdt = (q_soil[i] - q_evap - q_perc[i]) / (Psoil * A)
+        # ------------------------------------------------------------
+        # 4) Update soil store with overflow routed to runoff
+        #    (instead of clipping away mass)
+        # ------------------------------------------------------------
+        net_soil_depth_change = (
+            soil_candidate_depth
+            - soil_evap_depth
+            - (q_perc[i] * dt_s) / (Psoil * A) if Psoil > 0 else 0.0
+        )
 
-        D[i] = np.clip(D[i-1] + dDdt * dt_s, 0, Dmax)
+        D_trial = D[i - 1] + net_soil_depth_change
+
+        if D_trial > Dmax:
+            overflow_depth = D_trial - Dmax
+            D[i] = Dmax
+        elif D_trial < 0:
+            overflow_depth = 0.0
+            D[i] = 0.0
+        else:
+            overflow_depth = 0.0
+            D[i] = D_trial
+
+        # Soil overflow goes to runoff (closer to ICM behaviour)
+        runoff_depth += overflow_depth
+        q_overflow[i] = overflow_depth * A / dt_s
+
+        q_soil[i] = soil_candidate_depth * A / dt_s
+        q_runoff[i] = runoff_depth * A / dt_s
+        dep_store[i] = dep_store_after_fill
 
     df = pd.DataFrame({
         "time_hr": t,
         "rain": rain_mmhr,
         "soil_depth": D,
-        "saturation_pct": 100 * D / Dmax,
-        "percolation_lps": q_perc * 1000,
-        "ri_infiltration_lps": q_ri * 1000,
-        "soil_inflow_lps": q_soil * 1000
+        "saturation_pct": 100.0 * D / Dmax if Dmax > 0 else 0.0,
+        "depression_storage_mm": dep_store * 1000.0,
+        "soil_inflow_lps": q_soil * 1000.0,
+        "percolation_lps": q_perc * 1000.0,
+        "ri_infiltration_lps": q_ri * 1000.0,
+        "surface_runoff_lps": q_runoff * 1000.0,
+        "soil_overflow_to_runoff_lps": q_overflow * 1000.0,
+        "dep_storage_evap_lps": q_dep_evap * 1000.0,
+        "soil_evap_lps": q_soil_evap * 1000.0,
     })
 
     return df, Dt
