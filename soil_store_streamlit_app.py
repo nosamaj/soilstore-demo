@@ -16,11 +16,11 @@ with st.sidebar:
     st.header("Synthetic storm")
 
     storm_type = st.selectbox("Storm shape", ["Triangular", "Block", "Double peak"])
-    duration_hr = st.slider("Storm duration (hr)", 1.0, 48.0, 12.0)
+    duration_hr = st.slider("Storm duration (hr)", 0.25, 24.0, 1.00)
     peak_intensity_mmhr = st.slider("Peak intensity (mm/hr)", 1.0, 100.0, 20.0)
-    start_hr = st.slider("Storm start time (hr)", 0.0, 24.0, 2.0)
+    start_hr = st.slider("Storm start time (hr)", 0.0, 24.0, 4.0)
     total_sim_hr = st.slider("Simulation length (hr)", 6.0, 168.0, 48.0)
-    dt_min = st.slider("Time step (min)", 1, 60, 5)
+    dt_min = st.slider("Time step (min)", 0.2, 5.0, 1.0)
 
     st.markdown("---")
 
@@ -39,7 +39,7 @@ with st.sidebar:
 
     soil_depth_m = st.slider("Soil depth (m)", 0.1, 5.0, 1.0)
     soil_porosity_pct = st.slider("Soil porosity (%)", 1.0, 100.0, 50.0)
-    percolation_threshold_pct = st.slider("Percolation threshold (%)", 0.0, 100.0, 50.0)
+    percolation_threshold_pct = st.slider("Percolation threshold (%)", 0.0, 100.0, 10.5)
     percolation_coefficient = st.slider("Percolation coefficient (1/day)", 0.1, 10.0, 1.0)
     percolation_percentage = st.slider("Percolation % infiltrating", 0.0, 100.0, 5.0)
     initial_saturation = st.slider("Initial soil saturation (%)", 0.0, 100.0, 10.0)
@@ -84,8 +84,8 @@ def make_storm(t, storm_type, start, duration, peak):
 def run_model():
     A = 10000.0  # 1 hectare
 
-    dt_s = dt_min * 60
-    dt_hr = dt_min / 60
+    dt_s = dt_min * 60.0
+    dt_hr = dt_min / 60.0
 
     t = np.arange(0, total_sim_hr, dt_hr)
     rain_mmhr = make_storm(t, storm_type, start_hr, duration_hr, peak_intensity_mmhr)
@@ -95,21 +95,20 @@ def run_model():
     # ----------------------------
     # States
     # ----------------------------
-    D = np.zeros(n)                 # soil water depth [m]
-    dep_store = np.zeros(n)         # depression storage filled [m]
+    D = np.zeros(n)          # soil water depth [m]
+    dep_store = 0.0          # depression storage currently filled [m]
 
     # ----------------------------
     # Flows
     # ----------------------------
-    q_perc = np.zeros(n)            # total percolation-like outflow [m3/s]
-    q_ri = np.zeros(n)              # rainfall-induced infiltration to sewer [m3/s]
-    q_soil = np.zeros(n)            # inflow to soil store [m3/s]
-    q_runoff = np.zeros(n)          # simplified direct runoff [m3/s]
-    q_evap = np.zeros(n)            # evaporation from soil store [m3/s]
+    q_perc = np.zeros(n)     # percolation from soil store [m3/s]
+    q_ri = np.zeros(n)       # rainfall-induced infiltration to sewer [m3/s]
+    q_soil = np.zeros(n)     # inflow to soil store [m3/s]
+    q_runoff = np.zeros(n)   # simplified runoff [m3/s]
+    q_evap = np.zeros(n)     # evaporation from soil store [m3/s]
 
-    # useful diagnostics
-    q_perc_slow = np.zeros(n)       # slow storage-driven component [m3/s]
-    q_perc_fast = np.zeros(n)       # fast inflow-driven component [m3/s]
+    # diagnostics
+    x_excess = np.zeros(n)   # soil depth above threshold [m]
 
     # ----------------------------
     # Parameters
@@ -121,43 +120,29 @@ def run_model():
     Dmax = soil_depth_m
     Dt = (percolation_threshold_pct / 100.0) * Dmax
 
-    # Percolation coefficient treated as a time coefficient in days
-    # bigger value = slower / longer recession
+    # Percolation coefficient as timescale in days
     tau_s = percolation_coefficient * 86400.0
-    k_eff = 1.0 / tau_s if tau_s > 0 else 0.0
+    k_eff = 1.0 / tau_s if tau_s > 0 else 0.0  # 1/s
 
-    evap_full = potential_evap_mmday / 1000.0 / 86400.0  # m/s equivalent
+    evap_full = potential_evap_mmday / 1000.0 / 86400.0  # m/s
 
-    # ----------------------------
-    # Calibration / shape controls
-    # ----------------------------
-    nonlin_exp = 1.3   # 1.0 = linear; 1.2-1.5 gives a sharper ICM-like kick
-    fast_factor = 0.65 # fraction of q_soil contributing to fast early spike
-
-    # ----------------------------
-    # Initial conditions
-    # ----------------------------
     D[0] = np.clip((initial_saturation / 100.0) * Dmax, 0.0, Dmax)
     dep_store_max = depression_storage_mm / 1000.0
 
-    # ----------------------------
-    # Time stepping
-    # ----------------------------
     for i in range(1, n):
         rain_mps = rain_mmhr[i] / 1000.0 / 3600.0
-        rainfall_depth = rain_mps * dt_s  # rainfall depth over timestep [m]
+        rainfall_depth = rain_mps * dt_s  # [m] over timestep
 
         # ----------------------------------------
-        # 1) Depression storage filling
+        # 1) Depression storage
         # ----------------------------------------
-        available = max(dep_store_max - dep_store[i - 1], 0.0)
+        available = max(dep_store_max - dep_store, 0.0)
         fill = min(rainfall_depth, available)
-        dep_store[i] = dep_store[i - 1] + fill
-
+        dep_store += fill
         effective = rainfall_depth - fill
 
         # ----------------------------------------
-        # 2) Simplified rainfall partitioning
+        # 2) Simplified partitioning
         # ----------------------------------------
         soil_depth_input = (1.0 - runoff_fraction) * area_factor * effective
         runoff_depth = (
@@ -169,68 +154,93 @@ def run_model():
         q_runoff[i] = runoff_depth * A / dt_s
 
         # ----------------------------------------
-        # 3) Soil store evaporation
+        # 3) Soil evaporation
         # ----------------------------------------
         sat = D[i - 1] / Dmax if Dmax > 0 else 0.0
         q_evap[i] = evap_full * sat * A
 
-        # ----------------------------------------
-        # 4) Predictor step for threshold crossing
-        #    (removes timestep lag in onset)
-        # ----------------------------------------
-        if Psoil > 0:
-            D_pred = D[i - 1] + (q_soil[i] / (Psoil * A)) * dt_s
-        else:
-            D_pred = D[i - 1]
-
-        # ----------------------------------------
-        # 5) Thresholded outflow:
-        #    slow storage-driven + fast inflow-driven
-        # ----------------------------------------
-        if D_pred < Dt:
-            q_perc_slow[i] = 0.0
-            q_perc_fast[i] = 0.0
-            q_perc[i] = 0.0
-        else:
-            excess = max(D_pred - Dt, 0.0)
-
-            # slow component: ICM-like thresholded reservoir response
-            q_perc_slow[i] = k_eff * A * (excess ** nonlin_exp)
-
-            # fast component: needed to reproduce the sharp early spike
-            q_perc_fast[i] = fast_factor * q_soil[i]
-
-            q_perc[i] = q_perc_slow[i] + q_perc_fast[i]
-
-        # rainfall-induced infiltration to sewer
-        # internal notes / help describe this as proportional to percolation
-        q_ri[i] = alpha * q_perc[i] * Psoil
-
-        # ----------------------------------------
-        # 6) State update
-        # ----------------------------------------
-        if Psoil > 0:
-            dDdt = (q_soil[i] - q_evap[i] - q_perc[i]) / (Psoil * A)
-            D[i] = np.clip(D[i - 1] + dDdt * dt_s, 0.0, Dmax)
-        else:
+        # If no soil porosity, just zero everything safely
+        if Psoil <= 0:
             D[i] = 0.0
+            q_perc[i] = 0.0
+            q_ri[i] = 0.0
+            x_excess[i] = 0.0
+            continue
+
+        # ----------------------------------------
+        # 4) Work in storage-above-threshold space
+        # ----------------------------------------
+        x_old = max(D[i - 1] - Dt, 0.0)
+
+        # net forcing into soil store as depth rate [m/s]
+        # note: this is the rate entering the reservoir state equation
+        u = (q_soil[i] - q_evap[i]) / (Psoil * A)
+
+        if D[i - 1] < Dt:
+            # below threshold, fill toward threshold first
+            D_trial = D[i - 1] + u * dt_s
+
+            if D_trial <= Dt or k_eff <= 0.0:
+                # still below threshold after this step
+                D[i] = np.clip(D_trial, 0.0, Dmax)
+                q_perc[i] = 0.0
+                q_ri[i] = 0.0
+                x_excess[i] = max(D[i] - Dt, 0.0)
+            else:
+                # cross threshold during this step
+                # time spent filling up to threshold
+                t_to_threshold = (Dt - D[i - 1]) / u if u > 0 else dt_s
+                t_to_threshold = np.clip(t_to_threshold, 0.0, dt_s)
+                dt2 = dt_s - t_to_threshold
+
+                # now integrate the above-threshold excess for remaining time
+                expfac = np.exp(-k_eff * dt2)
+                x_new = (u / k_eff) * (1.0 - expfac)
+
+                D[i] = np.clip(Dt + x_new, 0.0, Dmax)
+                x_excess[i] = x_new
+                q_perc[i] = k_eff * A * x_new
+                q_ri[i] = alpha * q_perc[i]
+        else:
+            # already above threshold: exact driven linear reservoir step
+            if k_eff > 0.0:
+                expfac = np.exp(-k_eff * dt_s)
+                x_new = x_old * expfac + (u / k_eff) * (1.0 - expfac)
+            else:
+                x_new = x_old + u * dt_s
+
+            # do not allow negative excess
+            x_new = max(x_new, 0.0)
+
+            D[i] = np.clip(Dt + x_new, 0.0, Dmax)
+            x_excess[i] = x_new
+            q_perc[i] = k_eff * A * x_new
+            q_ri[i] = alpha * q_perc[i]
+
+        # ----------------------------------------
+        # 5) Cap at Dmax if needed
+        # ----------------------------------------
+        if D[i] > Dmax:
+            D[i] = Dmax
+            x_excess[i] = max(Dmax - Dt, 0.0)
+            q_perc[i] = k_eff * A * x_excess[i]
+            q_ri[i] = alpha * q_perc[i]
 
     df = pd.DataFrame({
         "time_hr": t,
         "rain": rain_mmhr,
         "soil_depth": D,
         "saturation_pct": 100.0 * D / Dmax if Dmax > 0 else np.zeros_like(D),
+        "soil_excess_above_threshold_m": x_excess,
         "soil_inflow_lps": q_soil * 1000.0,
         "percolation_lps": q_perc * 1000.0,
-        "percolation_slow_lps": q_perc_slow * 1000.0,
-        "percolation_fast_lps": q_perc_fast * 1000.0,
         "ri_infiltration_lps": q_ri * 1000.0,
         "runoff_lps": q_runoff * 1000.0,
         "evap_lps": q_evap * 1000.0,
-        "depression_storage_mm": dep_store * 1000.0
     })
 
     return df, Dt
+
 
 df, Dt = run_model()
 
